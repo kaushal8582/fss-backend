@@ -44,6 +44,7 @@ router.put("/credentials", authMiddleware, async (req, res) => {
       hasBearerToken: Boolean(creds.bearerToken),
       hasXAuthUserId: Boolean(creds.xAuthUserId),
       hasCookie: Boolean(creds.cookie),
+      cookieRecommended: !creds.cookie,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

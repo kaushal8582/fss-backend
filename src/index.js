@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const { connectDb } = require("./db/mongoose");
-const { env } = require("./config/env");
+const { env, isAllowedOrigin } = require("./config/env");
 const { loadFromDb } = require("./services/authCredentials");
 const authRoutes = require("./routes/auth");
 const downloadRoutes = require("./routes/download");
@@ -12,7 +12,13 @@ const app = express();
 
 app.use(
   cors({
-    origin: env.clientUrl,
+    origin(origin, callback) {
+      if (isAllowedOrigin(origin)) {
+        callback(null, origin || env.clientUrls[0]);
+      } else {
+        callback(null, false);
+      }
+    },
     credentials: true,
   })
 );

@@ -4,6 +4,24 @@ const { env } = require("../config/env");
 
 const router = express.Router();
 
+function extractToken(req) {
+  return (
+    req.cookies?.token ||
+    (req.headers.authorization?.startsWith("Bearer ")
+      ? req.headers.authorization.slice(7)
+      : null)
+  );
+}
+
+function cookieOptions() {
+  return {
+    httpOnly: true,
+    secure: env.isProduction,
+    sameSite: env.isProduction ? "none" : "lax",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  };
+}
+
 router.post("/login", async (req, res) => {
   const { password } = req.body;
 
@@ -17,23 +35,19 @@ router.post("/login", async (req, res) => {
 
   const token = jwt.sign({ role: "download" }, env.jwtSecret, { expiresIn: "7d" });
 
-  res.cookie("token", token, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-  });
+  res.cookie("token", token, cookieOptions());
 
-  res.json({ ok: true });
+  // Return token in body for cross-origin clients (Netlify + Render)
+  res.json({ ok: true, token });
 });
 
 router.post("/logout", (_req, res) => {
-  res.clearCookie("token");
+  res.clearCookie("token", cookieOptions());
   res.json({ ok: true });
 });
 
 router.get("/me", (req, res) => {
-  const token = req.cookies?.token;
+  const token = extractToken(req);
   if (!token) {
     return res.status(401).json({ error: "Not authenticated" });
   }

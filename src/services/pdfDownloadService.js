@@ -6,6 +6,11 @@ const {
 const { encryptRequest, decryptResponse } = require("./fssaiCrypto");
 const { getCredentials, getTokenExpiryWarning } = require("./authCredentials");
 const { getCompleteRegistrationPrev } = require("./expressRenewalClient");
+const { env } = require("../config/env");
+const {
+  refreshFssaiAuth,
+  isAutoRefreshConfigured,
+} = require("./fssaiAuthService");
 
 const LICENSE_CATEGORY_IDS = [2, 1, 3];
 
@@ -37,6 +42,11 @@ function extractRecords(decrypted) {
     decrypted.records ||
     []
   );
+}
+
+function normalizeLicenseCategoryId(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
 async function searchRefIdPage(certificateNumber, apptype = "R", page = 1) {
@@ -112,7 +122,10 @@ function recordToMatch(record, apptype) {
     certificateNumber: getLicenseNumber(record),
     companyName: (record.companyname || record.companyName || "").trim(),
     licenseCategory: record.licensecategoryname || record.licenseCategoryName || "",
-    licenseCategoryId: record.licensecategoryid || record.licenseCategoryId || 2,
+    licenseCategoryId:
+      normalizeLicenseCategoryId(
+        record.licensecategoryid || record.licenseCategoryId
+      ) || 2,
     status: record.statusdesc || record.statusDesc || "",
     state: record.statename || record.stateName || "",
     district: record.districtname || record.districtName || "",
@@ -136,6 +149,11 @@ async function searchCertificateAll(certificateNumber, preferApptype = "R") {
   return fallbackRecords
     .map((record) => recordToMatch(record, fallbackApptype))
     .filter(Boolean);
+}
+
+async function searchLicenseOnly(certificateNumber) {
+  const records = await searchRefIdAll(certificateNumber, "L");
+  return records.map((record) => recordToMatch(record, "L")).filter(Boolean);
 }
 
 function parseCertificateDigits(input) {
@@ -263,12 +281,24 @@ async function finalizeMatch(match) {
   };
 }
 
+async function finalizeLicenseMatch(match) {
+  return {
+    refId: match.refId,
+    record: match.record,
+    registrationNumber: match.certificateNumber,
+    apptype: "L",
+    licenseCategoryId: match.licenseCategoryId,
+    companyName: match.companyName,
+  };
+}
+
 async function searchThirteenDigitCertificate(prefix13, preferApptype = "R") {
+  const searchFn = preferApptype === "L" ? searchLicenseOnly : searchCertificateAll;
   const matches = (
     await Promise.all(
       Array.from({ length: 10 }, async (_, digit) => {
         const certificateNumber = `${prefix13}${digit}`;
-        const results = await searchCertificateAll(certificateNumber, preferApptype);
+        const results = await searchFn(certificateNumber);
         return results.map((match) => ({
           ...match,
           digit,
@@ -279,8 +309,9 @@ async function searchThirteenDigitCertificate(prefix13, preferApptype = "R") {
   ).flat();
 
   if (matches.length === 0) {
+    const label = preferApptype === "L" ? "license" : "registration or license";
     throw new Error(
-      `No registration or license found for: ${prefix13}. Provide the full 14-digit certificate number or refId.`
+      `No ${label} found for: ${prefix13}. Provide the full 14-digit certificate number or refId.`
     );
   }
 
@@ -290,7 +321,9 @@ async function searchThirteenDigitCertificate(prefix13, preferApptype = "R") {
     );
   }
 
-  return finalizeMatch(matches[0]);
+  return preferApptype === "L"
+    ? finalizeLicenseMatch(matches[0])
+    : finalizeMatch(matches[0]);
 }
 
 async function searchRefIdWithVariants(registrationNumber, preferApptype = "R") {
@@ -300,9 +333,14 @@ async function searchRefIdWithVariants(registrationNumber, preferApptype = "R") 
     return searchThirteenDigitCertificate(digits, preferApptype);
   }
 
-  const matches = await searchCertificateAll(digits, preferApptype);
+  const matches =
+    preferApptype === "L"
+      ? await searchLicenseOnly(digits)
+      : await searchCertificateAll(digits, preferApptype);
+
   if (matches.length === 0) {
-    throw new Error(`No registration or license found for: ${registrationNumber}`);
+    const label = preferApptype === "L" ? "license" : "registration or license";
+    throw new Error(`No ${label} found for: ${registrationNumber}`);
   }
 
   if (matches.length > 1) {
@@ -311,7 +349,9 @@ async function searchRefIdWithVariants(registrationNumber, preferApptype = "R") 
     );
   }
 
-  return finalizeMatch(matches[0]);
+  return preferApptype === "L"
+    ? finalizeLicenseMatch(matches[0])
+    : finalizeMatch(matches[0]);
 }
 
 async function resolveRefId(input, preferApptype = "R") {
@@ -358,16 +398,47 @@ function buildFilename(type, label, refId) {
   return `${type}-${safeLabel}-${refId}.pdf`;
 }
 
+async function retryAfterAuthRefresh(result, retryFn) {
+  if (!result.authExpired || !env.authRefreshOn401) {
+    return result;
+  }
+
+  if (!isAutoRefreshConfigured()) {
+    return result;
+  }
+
+  try {
+    await refreshFssaiAuth(true);
+    return retryFn();
+  } catch (err) {
+    return {
+      authExpired: true,
+      error: `Auth refresh failed: ${err.message}`,
+    };
+  }
+}
+
 async function downloadLicenseWithCategories(refId, licenseCategoryId) {
-  const categoryIds = licenseCategoryId
-    ? [licenseCategoryId, ...LICENSE_CATEGORY_IDS.filter((id) => id !== licenseCategoryId)]
+  const normalizedCategoryId = normalizeLicenseCategoryId(licenseCategoryId);
+  const categoryIds = normalizedCategoryId
+    ? [
+        normalizedCategoryId,
+        ...LICENSE_CATEGORY_IDS.filter((id) => id !== normalizedCategoryId),
+      ]
     : LICENSE_CATEGORY_IDS;
 
   for (const categoryId of categoryIds) {
-    const result = await downloadLicensePdfBuffer(refId, categoryId);
+    let result = await downloadLicensePdfBuffer(refId, categoryId);
+
     if (result.authExpired) {
-      return result;
+      result = await retryAfterAuthRefresh(result, () =>
+        downloadLicensePdfBuffer(refId, categoryId)
+      );
+      if (result.authExpired) {
+        return result;
+      }
     }
+
     if (result.pdfBuffer && result.pdfBuffer.length > 0) {
       return { ...result, categoryId };
     }
@@ -397,7 +468,13 @@ async function downloadRegistrationPdf(number) {
   }
 
   const refId = search.refId;
-  const result = await downloadRegistrationPdfBuffer(refId);
+  let result = await downloadRegistrationPdfBuffer(refId);
+
+  if (result.authExpired) {
+    result = await retryAfterAuthRefresh(result, () =>
+      downloadRegistrationPdfBuffer(refId)
+    );
+  }
 
   if (result.authExpired) {
     return { authExpired: true, error: result.error };
@@ -427,6 +504,13 @@ async function downloadLicensePdf(number) {
     search = await resolveRefId(number, "L");
   } catch (err) {
     return { error: err.message, notFound: true };
+  }
+
+  if (search.apptype && search.apptype !== "L") {
+    return {
+      error: "Certificate is a registration, not a license. Use the Registration tab.",
+      notFound: true,
+    };
   }
 
   const refId = search.refId;
